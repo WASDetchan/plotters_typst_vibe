@@ -1,0 +1,34 @@
+[package]
+name = "plotters_typst_vibe"
+version = "0.1.0"
+edition = "2021"
+authors = ["WASDetchan yarik.antipov2008@gmail.com", "Claude"]
+license = "MIT OR Apache-2.0"
+description = "100% videcoded typst backend for plotters - A Rust drawing library"
+keywords = ["plotting", "typst", "visualization", "graphics"]
+categories = ["visualization", "graphics"]
+readme = "README.md"
+
+[dependencies]
+plotters-backend = "0.3"
+
+[dependencies.image]
+version = "0.25"
+optional = true
+default-features = false
+features = ["png"]
+
+[dev-dependencies]
+plotters = "0.3"
+
+[features]
+default = []
+image = ["dep:image"]
+
+[[example]]
+name = "simple_plot"
+required-features = []
+
+[lib]
+name = "plotters_typst"
+path = "src/lib.rs"
