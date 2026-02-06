@@ -67,8 +67,13 @@ impl<'a> TypstBackend<'a> {
 
     fn init_canvas(&mut self, size: (u32, u32)) {
         let buf = self.target.get_mut();
-        // Create a box with absolute positioning for the canvas
-        writeln!(buf, "#box(width: {}pt, height: {}pt)[", size.0, size.1).unwrap();
+        // Create a box with absolute positioning and clipping for the canvas
+        writeln!(
+            buf,
+            "#box(width: {}pt, height: {}pt, clip: true)[",
+            size.0, size.1
+        )
+        .unwrap();
     }
 
     /// Create a new Typst drawing backend
@@ -316,18 +321,13 @@ impl<'a> DrawingBackend for TypstBackend<'a> {
             other => other,
         };
 
-        // Determine text alignment
-        let h_align = match style.anchor().h_pos {
-            HPos::Left => "left",
-            HPos::Right => "right",
-            HPos::Center => "center",
-        };
-
-        // Typst's baseline handling - adjust y position based on vertical alignment
-        let v_offset = match style.anchor().v_pos {
-            VPos::Top => font_size * 0.76,
-            VPos::Center => font_size * 0.35,
-            VPos::Bottom => 0.0,
+        // For vertical alignment, we use top-edge and bottom-edge
+        // top-edge accepts: "ascender", "cap-height", "x-height", "baseline", "bounds", or length
+        // bottom-edge accepts: "baseline", "descender", "bounds", or length
+        let (top_edge, bottom_edge) = match style.anchor().v_pos {
+            VPos::Top => ("\"bounds\"", "\"bounds\""),
+            VPos::Center => ("\"cap-height\"", "\"baseline\""),
+            VPos::Bottom => ("\"baseline\"", "\"baseline\""),
         };
 
         // Handle font style
@@ -351,18 +351,38 @@ impl<'a> DrawingBackend for TypstBackend<'a> {
 
         let rotation_close = if rotation_attr.is_empty() { "" } else { ")" };
 
+        // Use a simple approach: text in a box with manual horizontal alignment
+        let aligned_text = match style.anchor().h_pos {
+            HPos::Left => escaped_text.clone(),
+            HPos::Right => {
+                // Right align: measure and shift
+                format!(
+                    "#context {{ let m = measure([{}]); h(-m.width); [{}] }}",
+                    escaped_text, escaped_text
+                )
+            }
+            HPos::Center => {
+                // Center align: measure and shift by half
+                format!(
+                    "#context {{ let m = measure([{}]); h(-m.width / 2); [{}] }}",
+                    escaped_text, escaped_text
+                )
+            }
+        };
+
         let cmd = format!(
-            "  #place(dx: {}pt, dy: {}pt, {}text(size: {}pt, fill: {}, weight: {}, style: {}, font: \"{}\")[#align({})[\n    {}\n  ]]{})",
+            "  #place(dx: {}pt, dy: {}pt, {}box[#set text(size: {}pt, fill: {}, weight: {}, style: {}, font: \"{}\", top-edge: {}, bottom-edge: {}); {}]{})",
             x0,
-            y0 - v_offset as i32,
+            y0,
             rotation_attr,
             font_size,
             text_color,
             font_weight,
             font_style_attr,
             font_family,
-            h_align,
-            escaped_text,
+            top_edge,
+            bottom_edge,
+            aligned_text,
             rotation_close
         );
         self.write_command(&cmd);
@@ -452,6 +472,332 @@ impl Drop for TypstBackend<'_> {
             // drop should not panic, so we ignore a failed present
             let _ = self.present();
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use plotters::prelude::*;
+    use plotters::style::text_anchor::{HPos, Pos, VPos};
+    use std::fs;
+
+    static DST_DIR: &str = "target/test/typst";
+
+    fn checked_save_file(name: &str, content: &str) {
+        /*
+          Please use the Typst file to manually verify the results.
+        */
+        assert!(!content.is_empty());
+        fs::create_dir_all(DST_DIR).unwrap();
+        let file_name = format!("{}.typ", name);
+        let file_path = std::path::Path::new(DST_DIR).join(file_name);
+        println!("{:?} created", file_path);
+        fs::write(file_path, &content).unwrap();
+    }
+
+    fn draw_mesh_with_custom_ticks(tick_size: i32, test_name: &str) {
+        let mut content: String = Default::default();
+        {
+            let root = TypstBackend::with_string(&mut content, (500, 500)).into_drawing_area();
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption("This is a test", ("sans-serif", 20u32))
+                .set_all_label_area_size(40u32)
+                .build_cartesian_2d(0..10, 0..10)
+                .unwrap();
+
+            chart
+                .configure_mesh()
+                .set_all_tick_mark_size(tick_size)
+                .draw()
+                .unwrap();
+        }
+
+        checked_save_file(test_name, &content);
+
+        assert!(content.contains("This is a test"));
+    }
+
+    #[test]
+    fn test_draw_mesh_no_ticks() {
+        draw_mesh_with_custom_ticks(0, "test_draw_mesh_no_ticks");
+    }
+
+    #[test]
+    fn test_draw_mesh_negative_ticks() {
+        draw_mesh_with_custom_ticks(-10, "test_draw_mesh_negative_ticks");
+    }
+
+    #[test]
+    fn test_text_alignments() {
+        let mut content: String = Default::default();
+        {
+            let mut root = TypstBackend::with_string(&mut content, (500, 500));
+
+            let style = TextStyle::from(("sans-serif", 20).into_font())
+                .pos(Pos::new(HPos::Right, VPos::Top));
+            root.draw_text("right-align", &style, (150, 50)).unwrap();
+
+            let style = style.pos(Pos::new(HPos::Center, VPos::Top));
+            root.draw_text("center-align", &style, (150, 150)).unwrap();
+
+            let style = style.pos(Pos::new(HPos::Left, VPos::Top));
+            root.draw_text("left-align", &style, (150, 200)).unwrap();
+        }
+
+        checked_save_file("test_text_alignments", &content);
+
+        assert!(content.contains("right-align"));
+        assert!(content.contains("center-align"));
+        assert!(content.contains("left-align"));
+        // Right and center aligned text will have measure() calls
+        assert!(content.contains("measure("));
+    }
+
+    #[test]
+    fn test_text_draw() {
+        let mut content: String = Default::default();
+        {
+            let root = TypstBackend::with_string(&mut content, (1500, 800)).into_drawing_area();
+            let root = root
+                .titled("Image Title", ("sans-serif", 60).into_font())
+                .unwrap();
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption("All anchor point positions", ("sans-serif", 20u32))
+                .set_all_label_area_size(40u32)
+                .build_cartesian_2d(0..100i32, 0..50i32)
+                .unwrap();
+
+            chart
+                .configure_mesh()
+                .disable_x_mesh()
+                .disable_y_mesh()
+                .x_desc("X Axis")
+                .y_desc("Y Axis")
+                .draw()
+                .unwrap();
+
+            let ((x1, y1), (x2, y2), (x3, y3)) = ((-30, 30), (0, -30), (30, 30));
+
+            for (dy, trans) in [
+                FontTransform::None,
+                FontTransform::Rotate90,
+                FontTransform::Rotate180,
+                FontTransform::Rotate270,
+            ]
+            .iter()
+            .enumerate()
+            {
+                for (dx1, h_pos) in [HPos::Left, HPos::Right, HPos::Center].iter().enumerate() {
+                    for (dx2, v_pos) in [VPos::Top, VPos::Center, VPos::Bottom].iter().enumerate() {
+                        let x = 150_i32 + (dx1 as i32 * 3 + dx2 as i32) * 150;
+                        let y = 120 + dy as i32 * 150;
+                        let draw = |x, y, text| {
+                            root.draw(&Circle::new((x, y), 3, &BLACK.mix(0.5))).unwrap();
+                            let style = TextStyle::from(("sans-serif", 20).into_font())
+                                .pos(Pos::new(*h_pos, *v_pos))
+                                .transform(trans.clone());
+                            root.draw_text(text, &style, (x, y)).unwrap();
+                        };
+                        draw(x + x1, y + y1, "dood");
+                        draw(x + x2, y + y2, "dog");
+                        draw(x + x3, y + y3, "goog");
+                    }
+                }
+            }
+        }
+
+        checked_save_file("test_text_draw", &content);
+
+        // Text appears twice for center/right aligned text (once in measure, once displayed)
+        // So we expect more than 36 occurrences
+        assert!(content.matches("dog").count() >= 36);
+        assert!(content.matches("dood").count() >= 36);
+        assert!(content.matches("goog").count() >= 36);
+    }
+
+    #[test]
+    fn test_text_clipping() {
+        let mut content: String = Default::default();
+        {
+            let (width, height) = (500_i32, 500_i32);
+            let root = TypstBackend::with_string(&mut content, (width as u32, height as u32))
+                .into_drawing_area();
+
+            let style = TextStyle::from(("sans-serif", 20).into_font())
+                .pos(Pos::new(HPos::Center, VPos::Center));
+            root.draw_text("TOP LEFT", &style, (0, 0)).unwrap();
+            root.draw_text("TOP CENTER", &style, (width / 2, 0))
+                .unwrap();
+            root.draw_text("TOP RIGHT", &style, (width, 0)).unwrap();
+
+            root.draw_text("MIDDLE LEFT", &style, (0, height / 2))
+                .unwrap();
+            root.draw_text("MIDDLE RIGHT", &style, (width, height / 2))
+                .unwrap();
+
+            root.draw_text("BOTTOM LEFT", &style, (0, height)).unwrap();
+            root.draw_text("BOTTOM CENTER", &style, (width / 2, height))
+                .unwrap();
+            root.draw_text("BOTTOM RIGHT", &style, (width, height))
+                .unwrap();
+        }
+
+        checked_save_file("test_text_clipping", &content);
+    }
+
+    #[test]
+    fn test_series_labels() {
+        let mut content = String::default();
+        {
+            let (width, height) = (500, 500);
+            let root = TypstBackend::with_string(&mut content, (width, height)).into_drawing_area();
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption("All series label positions", ("sans-serif", 20u32))
+                .set_all_label_area_size(40u32)
+                .build_cartesian_2d(0..50i32, 0..50i32)
+                .unwrap();
+
+            chart
+                .configure_mesh()
+                .disable_x_mesh()
+                .disable_y_mesh()
+                .draw()
+                .unwrap();
+
+            chart
+                .draw_series(std::iter::once(Circle::new((5, 15), 5u32, &RED)))
+                .expect("Drawing error")
+                .label("Series 1")
+                .legend(|(x, y)| Circle::new((x, y), 3u32, RED.filled()));
+
+            chart
+                .draw_series(std::iter::once(Circle::new((5, 15), 10u32, &BLUE)))
+                .expect("Drawing error")
+                .label("Series 2")
+                .legend(|(x, y)| Circle::new((x, y), 3u32, BLUE.filled()));
+
+            for pos in vec![
+                SeriesLabelPosition::UpperLeft,
+                SeriesLabelPosition::MiddleLeft,
+                SeriesLabelPosition::LowerLeft,
+                SeriesLabelPosition::UpperMiddle,
+                SeriesLabelPosition::MiddleMiddle,
+                SeriesLabelPosition::LowerMiddle,
+                SeriesLabelPosition::UpperRight,
+                SeriesLabelPosition::MiddleRight,
+                SeriesLabelPosition::LowerRight,
+                SeriesLabelPosition::Coordinate(70, 70),
+            ]
+            .into_iter()
+            {
+                chart
+                    .configure_series_labels()
+                    .border_style(&BLACK.mix(0.5))
+                    .position(pos)
+                    .draw()
+                    .expect("Drawing error");
+            }
+        }
+
+        checked_save_file("test_series_labels", &content);
+    }
+
+    #[test]
+    fn test_draw_pixel_alphas() {
+        let mut content = String::default();
+        {
+            let (width, height) = (100_i32, 100_i32);
+            let root = TypstBackend::with_string(&mut content, (width as u32, height as u32))
+                .into_drawing_area();
+            root.fill(&WHITE).unwrap();
+
+            for i in -20..20 {
+                let alpha = i as f64 * 0.1;
+                root.draw_pixel((50 + i, 50 + i), &BLACK.mix(alpha))
+                    .unwrap();
+            }
+        }
+
+        checked_save_file("test_draw_pixel_alphas", &content);
+    }
+
+    #[test]
+    fn test_simple_drawing() {
+        let mut content: String = Default::default();
+        {
+            let mut backend = TypstBackend::with_string(&mut content, (500, 500));
+
+            // Draw a simple rectangle
+            backend
+                .draw_rect((10, 10), (100, 100), &RGBColor(255, 0, 0), true)
+                .unwrap();
+
+            backend.present().unwrap();
+        }
+
+        checked_save_file("test_simple_drawing", &content);
+        assert!(content.contains("rect"));
+        assert!(content.contains("rgb(255, 0, 0)"));
+    }
+
+    #[test]
+    fn test_draw_line() {
+        let mut content = String::default();
+        {
+            let mut backend = TypstBackend::with_string(&mut content, (300, 300));
+
+            backend
+                .draw_line((10, 10), (100, 100), &RGBColor(0, 255, 0))
+                .unwrap();
+
+            backend.present().unwrap();
+        }
+
+        checked_save_file("test_draw_line", &content);
+        assert!(content.contains("line"));
+        assert!(content.contains("rgb(0, 255, 0)"));
+    }
+
+    #[test]
+    fn test_draw_circle() {
+        let mut content = String::default();
+        {
+            let mut backend = TypstBackend::with_string(&mut content, (300, 300));
+
+            // Filled circle
+            backend
+                .draw_circle((150, 150), 50, &RGBColor(0, 0, 255), true)
+                .unwrap();
+
+            backend.present().unwrap();
+        }
+
+        checked_save_file("test_draw_circle", &content);
+        assert!(content.contains("circle"));
+        assert!(content.contains("rgb(0, 0, 255)"));
+    }
+
+    #[test]
+    fn test_draw_polygon() {
+        let mut content = String::default();
+        {
+            let mut backend = TypstBackend::with_string(&mut content, (300, 300));
+
+            let points = vec![(50, 50), (100, 50), (75, 100)];
+            backend
+                .fill_polygon(points, &RGBColor(255, 128, 0))
+                .unwrap();
+
+            backend.present().unwrap();
+        }
+
+        checked_save_file("test_draw_polygon", &content);
+        assert!(content.contains("polygon"));
+        assert!(content.contains("rgb(255, 128, 0)"));
     }
 }
 
